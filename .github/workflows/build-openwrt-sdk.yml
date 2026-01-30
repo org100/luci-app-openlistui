@@ -89,35 +89,45 @@ jobs:
             unzip file wget rsync ca-certificates zstd xz-utils \
             git
 
-          # 可选：某些 SDK 脚本还会找 python
           sudo ln -sf /usr/bin/python3 /usr/bin/python
 
-      - name: Select ImmortalWrt APK SDK URL
+      - name: Set exact SDK URL (NO listing parse / NO CF challenge)
         id: sdk
         shell: bash
         run: |
           set -euo pipefail
+
           arch="${{ matrix.arch }}"
+
+          # 这里写“精确文件名”，避免依赖目录 HTML（你日志里已有 CF challenge）
+          # 你贴出来的 x86_64 是 gcc-14.3.0，下面按同一版本先写死。
+          # 如果某个架构目录里 gcc 版本不同，把对应那行改成目录里的真实文件名即可。
+
           case "$arch" in
             x86_64)
-              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-sdk-x86-64_gcc-*-musl.Linux-x86_64.tar.zst"
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-sdk-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
               ;;
             aarch64)
-              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/armsr/armv8/immortalwrt-sdk-armsr-armv8_gcc-*-musl.Linux-x86_64.tar.zst"
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/armsr/armv8/immortalwrt-sdk-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
               ;;
             mips)
-              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/ath79/generic/immortalwrt-sdk-ath79-generic_gcc-*-musl.Linux-x86_64.tar.zst"
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/ath79/generic/immortalwrt-sdk-ath79-generic_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
               ;;
             mipsel)
-              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/ramips/mt76x8/immortalwrt-sdk-ramips-mt76x8_gcc-*-musl.Linux-x86_64.tar.zst"
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/ramips/mt76x8/immortalwrt-sdk-ramips-mt76x8_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
               ;;
             arm)
-              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/bcm27xx/bcm2708/immortalwrt-sdk-bcm27xx-bcm2708_gcc-*-musl_eabi.Linux-x86_64.tar.zst"
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/bcm27xx/bcm2708/immortalwrt-sdk-bcm27xx-bcm2708_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst"
               ;;
             armv7)
-              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/bcm27xx/bcm2709/immortalwrt-sdk-bcm27xx-bcm2709_gcc-*-musl_eabi.Linux-x86_64.tar.zst"
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/bcm27xx/bcm2709/immortalwrt-sdk-bcm27xx-bcm2709_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst"
+              ;;
+            *)
+              echo "Unknown arch: $arch"
+              exit 1
               ;;
           esac
+
           echo "sdk_url=$SDK_URL" >> "$GITHUB_OUTPUT"
           echo "Using SDK_URL=$SDK_URL"
 
@@ -127,24 +137,7 @@ jobs:
           set -euo pipefail
           mkdir -p sdk
           cd sdk
-
-          base="$(dirname "${{ steps.sdk.outputs.sdk_url }}")"
-          pat="$(basename "${{ steps.sdk.outputs.sdk_url }}")"
-
-          echo "Fetch listing: $base/"
-          html="$(wget -qO- "$base/")"
-
-          # 从 listing 里抓到真实文件名（wget 不支持 * glob）
-          file="$(echo "$html" | grep -oE 'immortalwrt-sdk[^"]+\.tar\.zst' | grep -E "$(echo "$pat" | sed 's/\*/.*/g')" | head -n1 || true)"
-          if [[ -z "$file" ]]; then
-            echo "❌ Cannot resolve SDK filename from $base/"
-            echo "$html" | sed -n '1,120p'
-            exit 1
-          fi
-
-          echo "Resolved SDK file: $file"
-          wget -q --show-progress -O sdk.tar.zst "$base/$file"
-
+          wget -q --show-progress -O sdk.tar.zst "${{ steps.sdk.outputs.sdk_url }}"
           tar --use-compress-program=unzstd -xf sdk.tar.zst --strip-components=1
           echo "SDK extracted:"
           ls -la
@@ -190,7 +183,7 @@ jobs:
 
           mapfile -t apks < <(find sdk/bin -type f -name "*${{ env.PKG_NAME }}*.apk" || true)
           if [[ ${#apks[@]} -eq 0 ]]; then
-            echo "❌ No .apk found. Dumping package outputs for debug:"
+            echo "❌ No .apk found. Dumping outputs for debug:"
             find sdk/bin -maxdepth 6 -type f \( -name "*.apk" -o -name "*.ipk" \) -print || true
             exit 1
           fi
