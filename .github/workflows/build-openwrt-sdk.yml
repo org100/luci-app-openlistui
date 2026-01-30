@@ -1,122 +1,164 @@
-name: Build OpenWrt package (luci-app-openlistui)
+name: build (apk release)
 
 on:
   workflow_dispatch:
-    inputs:
-      arch:
-        description: "Target arch to build (arm/armv7/aarch64/mips/mipsel/x86_64/all)"
-        required: true
-        default: "arm"
-      fast:
-        description: "Fast mode (skip feeds update) true/false"
-        required: true
-        default: "true"
-      dev:
-        description: "Dev mode (timestamp suffix) true/false"
-        required: true
-        default: "false"
+  push:
+    branches: ["main"]
+    paths:
+      - "**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-release
+  cancel-in-progress: false
+
+env:
+  PKG_NAME: luci-app-openlistui
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-24.04
+    outputs:
+      pkg_version: ${{ steps.ver.outputs.pkg_version }}
+      tag_name: ${{ steps.ver.outputs.tag_name }}
+      release_name: ${{ steps.ver.outputs.release_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse PKG_VERSION
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "Makefile" ]]; then
+            echo "❌ Makefile not found at repo root"
+            exit 1
+          fi
+
+          PKG_VERSION="$(grep -E '^\s*PKG_VERSION\s*:?=' Makefile | head -n1 | sed -E 's/.*PKG_VERSION\s*:?=\s*//; s/\r$//')"
+          if [[ -z "${PKG_VERSION}" ]]; then
+            echo "❌ Cannot parse PKG_VERSION from Makefile"
+            exit 1
+          fi
+
+          TAG_NAME="v${PKG_VERSION}"
+          RELEASE_NAME="${{ env.PKG_NAME }} ${TAG_NAME}"
+
+          echo "pkg_version=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+
+          echo "PKG_VERSION=${PKG_VERSION}"
+          echo "TAG_NAME=${TAG_NAME}"
+          echo "RELEASE_NAME=${RELEASE_NAME}"
+
+      - name: Create or reuse GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.ver.outputs.tag_name }}
+          RELEASE_NAME: ${{ steps.ver.outputs.release_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "✅ Release exists: $TAG_NAME"
+          else
+            gh release create "$TAG_NAME" \
+              --title "$RELEASE_NAME" \
+              --notes "Automated build for $RELEASE_NAME"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, mips, mipsel, arm, armv7]
+
+    env:
+      TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 关键：先腾磁盘（否则 OpenWrt SDK + build 很容易爆）
       - name: Free disk space
         shell: bash
         run: |
           set -eux
           df -h
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
           sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
           df -h
 
-      - name: Install dependencies
+      - name: Install deps
         shell: bash
         run: |
           set -eux
           sudo apt-get update
           sudo apt-get install -y \
             build-essential clang flex bison g++ gawk gcc-multilib gettext \
-            git libncurses5-dev libncursesw5-dev libssl-dev \
+            git libncurses-dev libssl-dev \
             python3 python3-setuptools python3-venv \
             rsync unzip zlib1g-dev file wget curl jq zstd
 
-      # 关键：修复 build.sh 的 rsync 递归复制问题（排除 build*/sdk/.git/打包文件）
-      - name: Patch build.sh (avoid rsync recursion)
+      - name: Run build.sh (${{ matrix.arch }})
         shell: bash
         run: |
-          set -eux
-          test -f build.sh
-          chmod +x build.sh
+          set -euo pipefail
+          chmod +x ./build.sh
 
-          # 把原来的 rsync 行替换成带 exclude 的版本
-          # 原脚本用 rsync 把仓库复制进 sdk/package/${PKG_NAME}，需要排除 build 输出目录，否则无限套娃
-          perl -0777 -i -pe 's#rsync\s+-a\s+--delete\s+\./\s+"sdk/package/\$\{PKG_NAME\}/"#rsync -a --delete \\\n  --exclude \x27.git\x27 \\\n  --exclude \x27.github\x27 \\\n  --exclude \x27build-*\x27 \\\n  --exclude \x27sdk\x27 \\\n  --exclude \x27*.tar.*\x27 \\\n  --exclude \x27*.ipk\x27 \\\n  --exclude \x27*.apk\x27 \\\n  ./ "sdk/package/${PKG_NAME}/"#g' build.sh
+          echo "== build.sh help =="
+          ./build.sh || true
 
-          # 防止之前残留目录影响（可选）
-          rm -rf build-* sdk || true
+          echo "== start build arch: ${{ matrix.arch }} =="
+          ./build.sh "${{ matrix.arch }}"
 
-      - name: Build
+      - name: Collect APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          # 通用收集：把所有 .apk 找出来（排除一些大目录/临时目录）
+          mapfile -t APKS < <(
+            find . \
+              -type d \( -name .git -o -name .github -o -name ".cache" -o -name "build_dir" \) -prune -false \
+              -o -type f -name "*.apk" -print
+          )
+
+          if [[ "${#APKS[@]}" -eq 0 ]]; then
+            echo "❌ No .apk produced for arch=${{ matrix.arch }}"
+            echo "Workspace top:"
+            ls -lah
+            exit 3
+          fi
+
+          SAFE_ARCH="${{ matrix.arch }}"
+          for f in "${APKS[@]}"; do
+            base="$(basename "$f")"
+            cp -v "$f" "out/${SAFE_ARCH}__${base}"
+          done
+
+          echo "Collected:"
+          ls -lah out
+
+      - name: Upload APKs to GitHub Release
         shell: bash
         env:
-          # 如果你要避免 GitHub API rate limit，可在仓库 Secrets 里加 GH_API_TOKEN
-          GH_API_TOKEN: ${{ secrets.GH_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eux
+          set -euo pipefail
+          gh release upload "${TAG_NAME}" out/*.apk --clobber
 
-          ARCH="${{ inputs.arch }}"
-          FAST="${{ inputs.fast }}"
-          DEV="${{ inputs.dev }}"
-
-          args=()
-
-          # build.sh 支持 -t token（用于获取 releases 版本号，脚本里有这个逻辑）:contentReference[oaicite:2]{index=2}
-          if [ -n "${GH_API_TOKEN:-}" ]; then
-            args+=("-t" "${GH_API_TOKEN}")
-          fi
-
-          # fast/dev 开关
-          if [ "${FAST}" = "true" ]; then
-            args+=("--fast")
-          fi
-          if [ "${DEV}" = "true" ]; then
-            args+=("--dev")
-          fi
-
-          # 多线程：给它一个合理的 jobs
-          # 你的脚本支持 -j 参数:contentReference[oaicite:3]{index=3}
-          args+=("-j" "$(nproc)")
-
-          # 运行
-          ./build.sh "${args[@]}" "${ARCH}"
-
-          echo "==== OUTPUT ===="
-          find . -type f \( -name "*.ipk" -o -name "*.apk" \) -print || true
-
-      - name: Collect artifacts
-        shell: bash
-        run: |
-          set -eux
-          mkdir -p dist
-
-          # build.sh 默认生成 build-<arch>/...，把所有 ipk/apk 收集出来
-          find . -type f \( -name "*.ipk" -o -name "*.apk" \) -print -exec cp -v {} dist/ \; || true
-
-          # 给一个目录树方便排查
-          ls -lah dist || true
-
-      - name: Upload artifacts
+      - name: Upload workflow artifact (backup)
         uses: actions/upload-artifact@v4
         with:
-          name: luci-app-openlistui-${{ inputs.arch }}
-          path: dist/*
+          name: ${{ env.PKG_NAME }}-${{ matrix.arch }}
+          path: out/*.apk
           if-no-files-found: error
