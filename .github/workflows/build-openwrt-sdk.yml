@@ -1,19 +1,18 @@
-name: build (apk release)
+name: Build APK (all arch) and Release
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
     paths:
-      - "**"
+      - "Makefile"
+      - "luasrc/**"
+      - "root/**"
+      - "po/**"
+      - "htdocs/**"
       - ".github/workflows/build.yml"
 
 permissions:
   contents: write
-
-concurrency:
-  group: build-apk-release
-  cancel-in-progress: false
 
 env:
   PKG_NAME: luci-app-openlistui
@@ -28,62 +27,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compute release tag (robust)
+      - name: Compute tag (safe)
         id: meta
         shell: bash
         run: |
           set -euo pipefail
 
-          chmod +x ./build.sh || true
-
-          # 1) 尝试从 build.sh 获取版本（如果脚本支持）
+          # 尽量从你的 Makefile 里取一个稳定版本（你脚本里是 PKG_VERSION_BASE:=x.y）
           VER=""
-          if ./build.sh --version >/dev/null 2>&1; then
-            VER="$(./build.sh --version | tr -d '\r' | head -n1 | sed -E 's/[^0-9.].*//; s/^[^0-9]*//')"
-          elif ./build.sh -v >/dev/null 2>&1; then
-            VER="$(./build.sh -v | tr -d '\r' | head -n1 | sed -E 's/[^0-9.].*//; s/^[^0-9]*//')"
+          if [[ -f "Makefile" ]]; then
+            VER="$(grep -E '^\s*PKG_VERSION_BASE\s*:?=' Makefile | head -n1 | sed -E 's/.*PKG_VERSION_BASE\s*:?=\s*//; s/\r$//; s/[[:space:]]+$//' || true)"
           fi
 
-          # 2) 尝试从项目内的“插件 Makefile”读取固定版本（避免根 Makefile 的 $(shell )）
-          # 只接受形如 1.2.3 的版本
-          if [[ -z "$VER" ]]; then
-            for f in \
-              "./Makefile" \
-              "./package/${{ env.PKG_NAME }}/Makefile" \
-              "./${{ env.PKG_NAME }}/Makefile" \
-              "./luci-app-openlistui/Makefile"
-            do
-              if [[ -f "$f" ]]; then
-                CAND="$(grep -E '^\s*PKG_VERSION\s*:?=\s*[0-9]([0-9.]*[0-9])\s*$' "$f" \
-                  | head -n1 \
-                  | sed -E 's/.*PKG_VERSION\s*:?=\s*//; s/\s*$//')"
-                if [[ -n "$CAND" ]]; then
-                  VER="$CAND"
-                  break
-                fi
-              fi
-            done
-          fi
-
-          # 3) 兜底：日期 + gitsha，保证 tag 永远合法
           if [[ -z "$VER" ]]; then
             DATE="$(date -u +%Y%m%d)"
             SHA="$(git rev-parse --short=8 HEAD)"
             TAG="r${DATE}-${SHA}"
           else
+            # 这里直接用 base version 当 tag（vX.Y），避免你 Makefile 里用 $(shell ...) 导致解析失败
             TAG="v${VER}"
           fi
 
           RELEASE_NAME="${{ env.PKG_NAME }} ${TAG}"
-
           echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
           echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
-
           echo "Resolved TAG=${TAG}"
           echo "Release name: ${RELEASE_NAME}"
 
-      - name: Create or reuse GitHub Release
-        shell: bash
+      - name: Create release (if not exists)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ steps.meta.outputs.tag_name }}
@@ -93,9 +64,7 @@ jobs:
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             echo "✅ Release exists: $TAG_NAME"
           else
-            gh release create "$TAG_NAME" \
-              --title "$RELEASE_NAME" \
-              --notes "Automated build for $RELEASE_NAME"
+            gh release create "$TAG_NAME" --title "$RELEASE_NAME" --notes "Automated build for $RELEASE_NAME"
           fi
 
   build:
@@ -106,80 +75,145 @@ jobs:
       matrix:
         arch: [x86_64, aarch64, mips, mipsel, arm, armv7]
 
-    env:
-      TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free disk space
-        shell: bash
-        run: |
-          set -eux
-          df -h
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
-          sudo apt-get clean
-          df -h
-
       - name: Install deps
-        shell: bash
         run: |
-          set -eux
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib gettext \
-            git libncurses-dev libssl-dev \
-            python3 python3-setuptools python3-venv \
-            rsync unzip zlib1g-dev file wget curl jq zstd
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gawk gcc-multilib flex bison gettext \
+            libncurses-dev libssl-dev python3 python3-distutils \
+            unzip file wget rsync ca-certificates zstd xz-utils
 
-      - name: Run build.sh (${{ matrix.arch }})
+      - name: Select ImmortalWrt APK SDK URL
+        id: sdk
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x ./build.sh
-          echo "== start build arch: ${{ matrix.arch }} =="
-          ./build.sh "${{ matrix.arch }}"
+          arch="${{ matrix.arch }}"
 
-      - name: Collect APKs
+          # 说明：
+          # - 你现在 build.sh 用的是 OpenWrt 23.05（ipk）
+          # - 这里改用 ImmortalWrt（apk）SDK，才能产出 .apk
+          #
+          # 你可以按你实际用的 ImmortalWrt 版本/target 再微调 URL：
+          # 常见：SNAPSHOT + 各 target 的 sdk
+          #
+          # 下面给的是示例映射（你若有固定 target，请告诉我我再精确到你仓库 build.sh 的那些 target）
+          case "$arch" in
+            x86_64)
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-sdk-x86-64_gcc-*-musl.Linux-x86_64.tar.zst"
+              ;;
+            aarch64)
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/armsr/armv8/immortalwrt-sdk-armsr-armv8_gcc-*-musl.Linux-x86_64.tar.zst"
+              ;;
+            mips)
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/ath79/generic/immortalwrt-sdk-ath79-generic_gcc-*-musl.Linux-x86_64.tar.zst"
+              ;;
+            mipsel)
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/ramips/mt76x8/immortalwrt-sdk-ramips-mt76x8_gcc-*-musl.Linux-x86_64.tar.zst"
+              ;;
+            arm)
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/bcm27xx/bcm2708/immortalwrt-sdk-bcm27xx-bcm2708_gcc-*-musl_eabi.Linux-x86_64.tar.zst"
+              ;;
+            armv7)
+              SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/bcm27xx/bcm2709/immortalwrt-sdk-bcm27xx-bcm2709_gcc-*-musl_eabi.Linux-x86_64.tar.zst"
+              ;;
+          esac
+
+          echo "sdk_url=$SDK_URL" >> "$GITHUB_OUTPUT"
+          echo "Using SDK_URL=$SDK_URL"
+
+      - name: Download & extract SDK
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out
+          mkdir -p sdk
+          cd sdk
 
-          # 收集所有 .apk（排除常见大目录/临时目录）
-          mapfile -t APKS < <(
-            find . \
-              -type d \( -name .git -o -name .github -o -name ".cache" -o -name "build_dir" -o -name "sdk" \) -prune -false \
-              -o -type f -name "*.apk" -print
-          )
+          # 用“目录 listing 找真实文件名”的方式解决 * 通配符（wget 不支持 glob）
+          base="$(dirname "${{ steps.sdk.outputs.sdk_url }}")"
+          pat="$(basename "${{ steps.sdk.outputs.sdk_url }}")"
 
-          if [[ "${#APKS[@]}" -eq 0 ]]; then
-            echo "❌ No .apk produced for arch=${{ matrix.arch }}"
-            echo "Workspace top:"
-            ls -lah
-            exit 3
+          echo "Fetch listing: $base/"
+          html="$(wget -qO- "$base/")"
+
+          # 从 listing 里抓到真正 sdk 文件名
+          file="$(echo "$html" | grep -oE 'immortalwrt-sdk[^"]+\.tar\.zst' | grep -E "$(echo "$pat" | sed 's/\*/.*/g')" | head -n1 || true)"
+          if [[ -z "$file" ]]; then
+            echo "❌ Cannot resolve SDK filename from $base/"
+            exit 1
           fi
 
-          for f in "${APKS[@]}"; do
-            base="$(basename "$f")"
-            cp -v "$f" "out/${{ matrix.arch }}__${base}"
-          done
+          echo "Resolved SDK file: $file"
+          wget -q --show-progress -O sdk.tar.zst "$base/$file"
 
-          echo "Collected:"
-          ls -lah out
+          tar --use-compress-program=unzstd -xf sdk.tar.zst --strip-components=1
+          ls -la
 
-      - name: Upload APKs to GitHub Release
+      - name: Copy package into SDK (safe copy, no recursion)
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release upload "${TAG_NAME}" out/*.apk --clobber
+          rm -rf "sdk/package/${{ env.PKG_NAME }}"
+          mkdir -p "sdk/package/${{ env.PKG_NAME }}"
 
-      - name: Upload workflow artifact (backup)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PKG_NAME }}-${{ matrix.arch }}
-          path: out/*.apk
-          if-no-files-found: error
+          # 只复制你的包需要的目录，避免把 sdk 再复制回 sdk/package 导致无限递归 + No space left
+          cp -a Makefile "sdk/package/${{ env.PKG_NAME }}/"
+          [[ -d luasrc ]] && cp -a luasrc "sdk/package/${{ env.PKG_NAME }}/"
+          [[ -d root ]] && cp -a root "sdk/package/${{ env.PKG_NAME }}/"
+          [[ -d po ]] && cp -a po "sdk/package/${{ env.PKG_NAME }}/"
+          [[ -d htdocs ]] && cp -a htdocs "sdk/package/${{ env.PKG_NAME }}/"
+
+          echo "Package tree copied:"
+          find "sdk/package/${{ env.PKG_NAME }}" -maxdepth 3 -type f | sed -n '1,200p'
+
+      - name: Build (APK)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sdk
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          echo "CONFIG_PACKAGE_${{ env.PKG_NAME }}=y" > .config
+          make defconfig
+
+          make "package/${{ env.PKG_NAME }}/compile" -j"$(nproc)" V=s
+
+          echo "Output (.apk/.ipk):"
+          find bin -type f \( -name "*.apk" -o -name "*.ipk" \) -print || true
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # ImmortalWrt apk：一般在 bin/packages/**/**/
+          mapfile -t apks < <(find sdk/bin -type f -name "*${{ env.PKG_NAME }}*.apk" || true)
+          if [[ ${#apks[@]} -eq 0 ]]; then
+            echo "❌ No .apk found. (Maybe SDK is ipk-based or target mismatch)"
+            # 作为调试，列一下 package 目录
+            find sdk/bin -maxdepth 5 -type f \( -name "*.apk" -o -name "*.ipk" \) -print || true
+            exit 1
+          fi
+
+          for f in "${apks[@]}"; do
+            base="$(basename "$f")"
+            cp -v "$f" "dist/${{ matrix.arch }}-${base}"
+          done
+
+          ls -lah dist
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG_NAME" dist/*.apk --clobber
