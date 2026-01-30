@@ -33,7 +33,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 尽量从你的 Makefile 里取一个稳定版本（你脚本里是 PKG_VERSION_BASE:=x.y）
           VER=""
           if [[ -f "Makefile" ]]; then
             VER="$(grep -E '^\s*PKG_VERSION_BASE\s*:?=' Makefile | head -n1 | sed -E 's/.*PKG_VERSION_BASE\s*:?=\s*//; s/\r$//; s/[[:space:]]+$//' || true)"
@@ -44,7 +43,6 @@ jobs:
             SHA="$(git rev-parse --short=8 HEAD)"
             TAG="r${DATE}-${SHA}"
           else
-            # 这里直接用 base version 当 tag（vX.Y），避免你 Makefile 里用 $(shell ...) 导致解析失败
             TAG="v${VER}"
           fi
 
@@ -79,14 +77,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install deps
+      - name: Install deps (Ubuntu 24.04 fixed)
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential gawk gcc-multilib flex bison gettext \
-            libncurses-dev libssl-dev python3 python3-distutils \
-            unzip file wget rsync ca-certificates zstd xz-utils
+            build-essential gawk flex bison gettext \
+            libncurses-dev libssl-dev \
+            python3 python3-pip python3-setuptools \
+            unzip file wget rsync ca-certificates zstd xz-utils \
+            git
+
+          # 可选：某些 SDK 脚本还会找 python
+          sudo ln -sf /usr/bin/python3 /usr/bin/python
 
       - name: Select ImmortalWrt APK SDK URL
         id: sdk
@@ -94,15 +98,6 @@ jobs:
         run: |
           set -euo pipefail
           arch="${{ matrix.arch }}"
-
-          # 说明：
-          # - 你现在 build.sh 用的是 OpenWrt 23.05（ipk）
-          # - 这里改用 ImmortalWrt（apk）SDK，才能产出 .apk
-          #
-          # 你可以按你实际用的 ImmortalWrt 版本/target 再微调 URL：
-          # 常见：SNAPSHOT + 各 target 的 sdk
-          #
-          # 下面给的是示例映射（你若有固定 target，请告诉我我再精确到你仓库 build.sh 的那些 target）
           case "$arch" in
             x86_64)
               SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-sdk-x86-64_gcc-*-musl.Linux-x86_64.tar.zst"
@@ -123,7 +118,6 @@ jobs:
               SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/bcm27xx/bcm2709/immortalwrt-sdk-bcm27xx-bcm2709_gcc-*-musl_eabi.Linux-x86_64.tar.zst"
               ;;
           esac
-
           echo "sdk_url=$SDK_URL" >> "$GITHUB_OUTPUT"
           echo "Using SDK_URL=$SDK_URL"
 
@@ -134,17 +128,17 @@ jobs:
           mkdir -p sdk
           cd sdk
 
-          # 用“目录 listing 找真实文件名”的方式解决 * 通配符（wget 不支持 glob）
           base="$(dirname "${{ steps.sdk.outputs.sdk_url }}")"
           pat="$(basename "${{ steps.sdk.outputs.sdk_url }}")"
 
           echo "Fetch listing: $base/"
           html="$(wget -qO- "$base/")"
 
-          # 从 listing 里抓到真正 sdk 文件名
+          # 从 listing 里抓到真实文件名（wget 不支持 * glob）
           file="$(echo "$html" | grep -oE 'immortalwrt-sdk[^"]+\.tar\.zst' | grep -E "$(echo "$pat" | sed 's/\*/.*/g')" | head -n1 || true)"
           if [[ -z "$file" ]]; then
             echo "❌ Cannot resolve SDK filename from $base/"
+            echo "$html" | sed -n '1,120p'
             exit 1
           fi
 
@@ -152,23 +146,23 @@ jobs:
           wget -q --show-progress -O sdk.tar.zst "$base/$file"
 
           tar --use-compress-program=unzstd -xf sdk.tar.zst --strip-components=1
+          echo "SDK extracted:"
           ls -la
 
-      - name: Copy package into SDK (safe copy, no recursion)
+      - name: Copy package into SDK (NO recursion / NO rsync blow-up)
         shell: bash
         run: |
           set -euo pipefail
           rm -rf "sdk/package/${{ env.PKG_NAME }}"
           mkdir -p "sdk/package/${{ env.PKG_NAME }}"
 
-          # 只复制你的包需要的目录，避免把 sdk 再复制回 sdk/package 导致无限递归 + No space left
           cp -a Makefile "sdk/package/${{ env.PKG_NAME }}/"
           [[ -d luasrc ]] && cp -a luasrc "sdk/package/${{ env.PKG_NAME }}/"
           [[ -d root ]] && cp -a root "sdk/package/${{ env.PKG_NAME }}/"
           [[ -d po ]] && cp -a po "sdk/package/${{ env.PKG_NAME }}/"
           [[ -d htdocs ]] && cp -a htdocs "sdk/package/${{ env.PKG_NAME }}/"
 
-          echo "Package tree copied:"
+          echo "Package files copied:"
           find "sdk/package/${{ env.PKG_NAME }}" -maxdepth 3 -type f | sed -n '1,200p'
 
       - name: Build (APK)
@@ -188,24 +182,21 @@ jobs:
           echo "Output (.apk/.ipk):"
           find bin -type f \( -name "*.apk" -o -name "*.ipk" \) -print || true
 
-      - name: Collect artifacts
+      - name: Collect APK artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
 
-          # ImmortalWrt apk：一般在 bin/packages/**/**/
           mapfile -t apks < <(find sdk/bin -type f -name "*${{ env.PKG_NAME }}*.apk" || true)
           if [[ ${#apks[@]} -eq 0 ]]; then
-            echo "❌ No .apk found. (Maybe SDK is ipk-based or target mismatch)"
-            # 作为调试，列一下 package 目录
-            find sdk/bin -maxdepth 5 -type f \( -name "*.apk" -o -name "*.ipk" \) -print || true
+            echo "❌ No .apk found. Dumping package outputs for debug:"
+            find sdk/bin -maxdepth 6 -type f \( -name "*.apk" -o -name "*.ipk" \) -print || true
             exit 1
           fi
 
           for f in "${apks[@]}"; do
-            base="$(basename "$f")"
-            cp -v "$f" "dist/${{ matrix.arch }}-${base}"
+            cp -v "$f" "dist/${{ matrix.arch }}-$(basename "$f")"
           done
 
           ls -lah dist
@@ -214,6 +205,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        shell: bash
         run: |
           set -euo pipefail
           gh release upload "$TAG_NAME" dist/*.apk --clobber
