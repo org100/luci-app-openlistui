@@ -22,46 +22,72 @@ jobs:
   prepare:
     runs-on: ubuntu-24.04
     outputs:
-      pkg_version: ${{ steps.ver.outputs.pkg_version }}
-      tag_name: ${{ steps.ver.outputs.tag_name }}
-      release_name: ${{ steps.ver.outputs.release_name }}
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      release_name: ${{ steps.meta.outputs.release_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Parse PKG_VERSION
-        id: ver
+      - name: Compute release tag (robust)
+        id: meta
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -f "Makefile" ]]; then
-            echo "❌ Makefile not found at repo root"
-            exit 1
+
+          chmod +x ./build.sh || true
+
+          # 1) 尝试从 build.sh 获取版本（如果脚本支持）
+          VER=""
+          if ./build.sh --version >/dev/null 2>&1; then
+            VER="$(./build.sh --version | tr -d '\r' | head -n1 | sed -E 's/[^0-9.].*//; s/^[^0-9]*//')"
+          elif ./build.sh -v >/dev/null 2>&1; then
+            VER="$(./build.sh -v | tr -d '\r' | head -n1 | sed -E 's/[^0-9.].*//; s/^[^0-9]*//')"
           fi
 
-          PKG_VERSION="$(grep -E '^\s*PKG_VERSION\s*:?=' Makefile | head -n1 | sed -E 's/.*PKG_VERSION\s*:?=\s*//; s/\r$//')"
-          if [[ -z "${PKG_VERSION}" ]]; then
-            echo "❌ Cannot parse PKG_VERSION from Makefile"
-            exit 1
+          # 2) 尝试从项目内的“插件 Makefile”读取固定版本（避免根 Makefile 的 $(shell )）
+          # 只接受形如 1.2.3 的版本
+          if [[ -z "$VER" ]]; then
+            for f in \
+              "./Makefile" \
+              "./package/${{ env.PKG_NAME }}/Makefile" \
+              "./${{ env.PKG_NAME }}/Makefile" \
+              "./luci-app-openlistui/Makefile"
+            do
+              if [[ -f "$f" ]]; then
+                CAND="$(grep -E '^\s*PKG_VERSION\s*:?=\s*[0-9]([0-9.]*[0-9])\s*$' "$f" \
+                  | head -n1 \
+                  | sed -E 's/.*PKG_VERSION\s*:?=\s*//; s/\s*$//')"
+                if [[ -n "$CAND" ]]; then
+                  VER="$CAND"
+                  break
+                fi
+              fi
+            done
           fi
 
-          TAG_NAME="v${PKG_VERSION}"
-          RELEASE_NAME="${{ env.PKG_NAME }} ${TAG_NAME}"
+          # 3) 兜底：日期 + gitsha，保证 tag 永远合法
+          if [[ -z "$VER" ]]; then
+            DATE="$(date -u +%Y%m%d)"
+            SHA="$(git rev-parse --short=8 HEAD)"
+            TAG="r${DATE}-${SHA}"
+          else
+            TAG="v${VER}"
+          fi
 
-          echo "pkg_version=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          RELEASE_NAME="${{ env.PKG_NAME }} ${TAG}"
+
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
           echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
 
-          echo "PKG_VERSION=${PKG_VERSION}"
-          echo "TAG_NAME=${TAG_NAME}"
-          echo "RELEASE_NAME=${RELEASE_NAME}"
+          echo "Resolved TAG=${TAG}"
+          echo "Release name: ${RELEASE_NAME}"
 
       - name: Create or reuse GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.ver.outputs.tag_name }}
-          RELEASE_NAME: ${{ steps.ver.outputs.release_name }}
+          TAG_NAME: ${{ steps.meta.outputs.tag_name }}
+          RELEASE_NAME: ${{ steps.meta.outputs.release_name }}
         run: |
           set -euo pipefail
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
@@ -112,10 +138,6 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./build.sh
-
-          echo "== build.sh help =="
-          ./build.sh || true
-
           echo "== start build arch: ${{ matrix.arch }} =="
           ./build.sh "${{ matrix.arch }}"
 
@@ -125,10 +147,10 @@ jobs:
           set -euo pipefail
           mkdir -p out
 
-          # 通用收集：把所有 .apk 找出来（排除一些大目录/临时目录）
+          # 收集所有 .apk（排除常见大目录/临时目录）
           mapfile -t APKS < <(
             find . \
-              -type d \( -name .git -o -name .github -o -name ".cache" -o -name "build_dir" \) -prune -false \
+              -type d \( -name .git -o -name .github -o -name ".cache" -o -name "build_dir" -o -name "sdk" \) -prune -false \
               -o -type f -name "*.apk" -print
           )
 
@@ -139,10 +161,9 @@ jobs:
             exit 3
           fi
 
-          SAFE_ARCH="${{ matrix.arch }}"
           for f in "${APKS[@]}"; do
             base="$(basename "$f")"
-            cp -v "$f" "out/${SAFE_ARCH}__${base}"
+            cp -v "$f" "out/${{ matrix.arch }}__${base}"
           done
 
           echo "Collected:"
